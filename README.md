@@ -5,6 +5,8 @@ threads.
 
 **Note**: This library isn't quite ready for use.
 
+[![Travis Build Status](https://travis-ci.org/carllerche/futures-pool.svg?branch=master)](https://travis-ci.org/carllerche/futures-pool)
+
 ### Why not Rayon?
 
 Rayon is designed to handle parallelizing single computations by breaking them
