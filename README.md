@@ -3,6 +3,24 @@
 A library for scheduling execution of futures concurrently across a pool of
 threads.
 
+**Note**: This library isn't quite ready for use.
+
+### Why not Rayon?
+
+Rayon is designed to handle parallelizing single computations by breaking them
+into smaller chunks. The scheduling for each individual chunk doesn't matter as
+long as the root computation completes in a timely fashion. In other words,
+Rayon does not provide any guarantees of fairness with regards to how each task
+gets scheduled.
+
+On the other hand, `futures-pool` is a general purpose scheduler and attempts to
+schedule each task fairly. This is the ideal behavior when scheduling a set of
+unrelated tasks.
+
+### Why not futures-cpupool?
+
+It's 10x slower.
+
 ## Usage
 
 To use `futures-pool`, first add this to your `Cargo.toml`:
@@ -22,6 +40,26 @@ fn main() {
 }
 ```
 ## Examples
+
+```rust
+extern crate futures;
+extern crate futures_pool;
+
+use futures::*;
+use futures::sync::oneshot;
+use futures_pool::*;
+
+pub fn main() {
+    let (tx, _pool) = Pool::new();
+
+    let res = oneshot::spawn(future::lazy(|| {
+        println!("Running on the pool");
+        Ok::<_, ()>("complete")
+    }), &tx);
+
+    println!("Result: {:?}", res.wait());
+}
+```
 
 ## License
 
