@@ -38,7 +38,9 @@ struct Inner {
     ref_count: AtomicUsize,
 
     // Store the future at the head of the struct
-    future: Spawn<BoxFuture>,
+    //
+    // The future is dropped immediately when it transitions to Complete
+    future: Option<Spawn<BoxFuture>>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -68,7 +70,7 @@ impl Task {
             next: AtomicPtr::new(ptr::null_mut()),
             state: AtomicUsize::new(State::new().into()),
             ref_count: AtomicUsize::new(1),
-            future: executor::spawn(Box::new(f)),
+            future: Some(executor::spawn(Box::new(f))),
         });
 
         Task { ptr: Box::into_raw(inner) }
@@ -100,14 +102,19 @@ impl Task {
 
         trace!("Task::run; state={:?}", State::from(self.inner().state.load(Relaxed)));
 
-        let res = self.inner_mut().future
+        let res = self.inner_mut().future.as_mut().unwrap()
             .poll_future_notify(unpark, self.ptr as usize);
 
         match res {
             Ok(Async::Ready(_)) | Err(_) => {
                 trace!("    -> task complete");
+
+                // Drop the future
+                self.inner_mut().drop_future();
+
                 // Transition to the completed state
                 self.inner().state.store(State::Complete.into(), Release);
+
                 false
             }
             _ => {
@@ -260,8 +267,18 @@ impl Inner {
             next: AtomicPtr::new(ptr::null_mut()),
             state: AtomicUsize::new(State::stub().into()),
             ref_count: AtomicUsize::new(0),
-            future: executor::spawn(Box::new(future::empty())),
+            future: Some(executor::spawn(Box::new(future::empty()))),
         }
+    }
+
+    fn drop_future(&mut self) {
+        let _ = self.future.take();
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.drop_future();
     }
 }
 
