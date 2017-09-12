@@ -15,9 +15,10 @@ mod task;
 use deque::Deque;
 use task::Task;
 
-use futures::Future;
+use futures::{Future, Poll, Async};
 use futures::executor::Notify;
 use futures::future::{Executor, ExecuteError};
+use futures::task::AtomicTask;
 
 use rand::{Rng, SeedableRng, XorShiftRng};
 
@@ -64,12 +65,18 @@ struct Config {
 #[derive(Debug)]
 struct Inner {
     // Pool state
-    //
-    // Tracks:
-    // * Total worker count
-    // * Active worker count
-    // * Pool lifecycle
     state: AtomicUsize,
+
+    // Number of futures currently being managed by the pool.
+    num_futures: AtomicUsize,
+
+    // Number of outstanding `Sender` handles
+    num_senders: AtomicUsize,
+
+    // Number of workers who haven't reached the final state of shutdown
+    //
+    // This is only used as part of the shutdown logic
+    num_workers: AtomicUsize,
 
     // Used to generate a thread local RNG seed
     next_thread_id: AtomicUsize,
@@ -78,6 +85,9 @@ struct Inner {
     //
     // This will *usually* be a small number
     workers: Box<[WorkerEntry]>,
+
+    // Task notified when the worker shuts down
+    shutdown_task: AtomicTask,
 
     // Configuration
     config: Config,
@@ -112,16 +122,11 @@ const LIFECYCLE_MASK: usize = 0b11;
 /// The scheduler is running
 const RUNNING: usize = 0b00;
 
-/*
 /// The scheduler is shutting down
 const SHUTDOWN: usize = 0b01;
 
 /// The scheduler has stopped, this is more aggressive than shutdown.
 const STOP: usize = 0b10;
-
-/// The scheduler has terminated
-const TERMINATED: usize = 0b11;
-*/
 
 /// Extracts the head of the worker stack from the scheduler state
 const STACK_MASK: usize = ((1 << 15) - 1) << STACK_SHIFT;
@@ -290,8 +295,12 @@ impl Builder {
 
         let inner = Arc::new(Inner {
             state: AtomicUsize::new(State::new().into()),
+            num_futures: AtomicUsize::new(0),
+            num_senders: AtomicUsize::new(1),
+            num_workers: AtomicUsize::new(self.pool_size),
             next_thread_id: AtomicUsize::new(0),
             workers: workers.into_boxed_slice(),
+            shutdown_task: AtomicTask::new(),
             config: self.config.clone(),
         });
 
@@ -342,6 +351,41 @@ impl Pool {
         let state: State = self.inner.state.load(Relaxed).into();
         state.is_running()
     }
+
+    /// Shutdown the pool
+    ///
+    /// Perform an orderly shutdown.
+    pub fn shutdown(&mut self) {
+        self.inner.shutdown();
+    }
+
+    /// Shutdown the pool immediately
+    ///
+    /// All queued futures are dropped.
+    pub fn force_shutdown(&mut self) -> Result<(), Self> {
+        unimplemented!();
+    }
+}
+
+impl Future for Pool {
+    type Item = ();
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<(), ()> {
+        self.inner.shutdown_task.register();
+
+        let state: State = self.inner.state.load(Acquire).into();
+
+        if !state.is_stop() {
+            return Ok(Async::NotReady);
+        }
+
+        if 0 != self.inner.num_workers.load(Acquire) {
+            return Ok(Async::NotReady);
+        }
+
+        Ok(().into())
+    }
 }
 
 // ===== impl Sender ======
@@ -353,9 +397,20 @@ impl<T> Executor<T> for Sender
     where T: Future<Item = (), Error = ()> + Send + 'static,
 {
     fn execute(&self, f: T) -> Result<(), ExecuteError<T>> {
+        use futures::future::ExecuteErrorKind::Shutdown;
+
+        let state: State = self.inner.state.load(Acquire).into();
+
+        if !state.is_running() {
+            return Err(ExecuteError::new(Shutdown, f));
+        }
+
+        // Create a new task for the future
         let task = Task::new(f);
+
         // TODO: handle the error
         let _ = self.inner.submit(task, &self.inner);
+
         Ok(())
     }
 }
@@ -363,9 +418,27 @@ impl<T> Executor<T> for Sender
 impl Clone for Sender {
     #[inline]
     fn clone(&self) -> Sender {
-        Sender {
-            inner: self.inner.clone(),
+        let inner = self.inner.clone();
+
+        // The clone above will panic if the inc below might overflow
+        inner.num_senders.fetch_add(1, Relaxed);
+
+        Sender { inner }
+    }
+}
+
+impl Drop for Sender {
+    fn drop(&mut self) {
+        if self.inner.num_senders.fetch_sub(1, AcqRel) != 1 {
+            return;
         }
+
+        if self.inner.num_futures.load(Acquire) != 0 {
+            return;
+        }
+
+        // The pool can no longer do any work, so shut it down
+        self.inner.shutdown();
     }
 }
 
@@ -393,6 +466,105 @@ macro_rules! worker_loop {
 }
 
 impl Inner {
+    /// Start shutting down the pool. This means that no new futures will be
+    /// accepted.
+    fn shutdown(&self) {
+        let mut state: State = self.state.load(Acquire).into();
+
+        loop {
+            let mut next = state;
+
+            if !next.set_shutdown() {
+                // Already transitioned to shutting down
+                return;
+            }
+
+            let actual = self.state.compare_and_swap(
+                state.into(), next.into(), AcqRel).into();
+
+            if state == actual {
+                state = next;
+                break;
+            }
+
+            state = actual;
+        }
+
+        // Only transition to terminate if there are no futures currently on the
+        // pool
+        if self.num_futures.load(Acquire) != 0 {
+            return;
+        }
+
+        // The pool is idle, start terminating
+        loop {
+            let mut next = state;
+
+            if !next.set_stop() {
+                // Already transitioned to the stop state
+                return;
+            }
+
+            let actual = self.state.compare_and_swap(
+                state.into(), next.into(), AcqRel).into();
+
+            if state == actual {
+                break;
+            }
+
+            state = actual;
+        }
+
+        // Wakeup all sleeping workers. They will wake up, see the state
+        // transition, and terminate.
+        while let Some((idx, worker_state)) = self.pop_sleeper(WORKER_SIGNALED) {
+            self.signal_stop(idx, worker_state);
+        }
+    }
+
+    /// Signals to the worker that it should stop
+    fn signal_stop(&self, worker: usize, mut state: WorkerState) {
+        let worker = &self.workers[worker];
+
+        // Transition the worker state to signaled
+        loop {
+            let mut next = state;
+
+            if state.lifecycle() == WORKER_SHUTDOWN {
+                // If the worker is in the shutdown state, then it will never be
+                // started again.
+                self.worker_terminated();
+
+                return;
+            } else if state.lifecycle() != WORKER_SLEEPING {
+
+                // All other states will naturally converge to a state of
+                // shutdown.
+                return;
+            }
+
+            next.set_lifecycle(WORKER_SIGNALED);
+
+            let actual = worker.state.compare_and_swap(
+                state.into(), next.into(), AcqRel).into();
+
+            if actual == state {
+                break;
+            }
+
+            state = actual;
+        }
+
+        // Wakeup the worker
+        worker.wakeup();
+    }
+
+    fn worker_terminated(&self) {
+        if 1 == self.num_workers.fetch_sub(1, AcqRel) {
+            self.shutdown_task.notify();
+        }
+    }
+
     /// Submit a task to the scheduler.
     ///
     /// Called from either inside or outside of the scheduler. If currently on
@@ -1034,8 +1206,39 @@ impl State {
     }
 
     #[inline]
+    fn set_lifecycle(&mut self, val: usize) {
+        debug_assert_eq!(val & LIFECYCLE_MASK, val);
+        self.0 = (self.0 & !LIFECYCLE_MASK) | val;
+    }
+
+    #[inline]
     fn is_running(&self) -> bool {
         self.lifecycle() == RUNNING
+    }
+
+    #[inline]
+    fn set_shutdown(&mut self) -> bool {
+        if self.lifecycle() >= SHUTDOWN {
+            false
+        } else {
+            self.set_lifecycle(SHUTDOWN);
+            true
+        }
+    }
+
+    #[inline]
+    fn is_stop(&self) -> bool {
+        self.lifecycle() == STOP
+    }
+
+    #[inline]
+    fn set_stop(&mut self) -> bool {
+        if self.lifecycle() >= STOP {
+            false
+        } else {
+            self.set_lifecycle(STOP);
+            true
+        }
     }
 
     #[inline]
