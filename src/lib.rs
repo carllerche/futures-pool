@@ -225,7 +225,7 @@ thread_local!(static CURRENT_WORKER: Cell<*const Worker> = Cell::new(0 as *const
 
 impl Builder {
     /// Returns a builder with default values
-    pub fn new() -> Builder {
+    fn new() -> Builder {
         let num_cpus = num_cpus::get();
 
         Builder {
@@ -334,6 +334,11 @@ impl Pool {
         Builder::new().build()
     }
 
+    /// Build a Pool with custom settings
+    pub fn builder() -> Builder {
+        Builder::new()
+    }
+
     /// Start a core thread, causing it to idly wait for work.
     ///
     /// This overrides the default policy of starting core threads only when new
@@ -361,14 +366,14 @@ impl Pool {
     ///
     /// Perform an orderly shutdown.
     pub fn shutdown(&mut self) {
-        self.inner.shutdown();
+        self.inner.shutdown(false);
     }
 
     /// Shutdown the pool immediately
     ///
     /// All queued futures are dropped.
-    pub fn force_shutdown(&mut self) -> Result<(), Self> {
-        unimplemented!();
+    pub fn force_shutdown(&mut self) {
+        self.inner.shutdown(true);
     }
 }
 
@@ -480,7 +485,7 @@ macro_rules! worker_loop {
 impl Inner {
     /// Start shutting down the pool. This means that no new futures will be
     /// accepted.
-    fn shutdown(&self) {
+    fn shutdown(&self, force: bool) {
         let mut state: State = self.state.load(Acquire).into();
 
         trace!("shutdown; state={:?}", state);
@@ -495,6 +500,10 @@ impl Inner {
             }
 
             next.set_shutdown();
+
+            if force {
+                next.clear_num_futures();
+            }
 
             let actual = self.state.compare_and_swap(
                 state.into(), next.into(), AcqRel).into();
@@ -893,10 +902,9 @@ impl Worker {
     }
 
     fn run2(&self) {
+        use deque::Poll::*;
+
         // Get the notifier.
-        //
-        // TODO: Should this be shared across workers? Probably doesn't matter
-        // much?
         let notify = Arc::new(Notifier {
             inner: Arc::downgrade(&self.inner),
         });
@@ -940,13 +948,28 @@ impl Worker {
                 // Yield the thread
                 thread::yield_now();
             } else {
-                self.sleep();
+                if !self.sleep() {
+                    // The sleep expired and now the worker should shutdown due
+                    // to being idle.
+                    unimplemented!();
+                }
             }
 
             // If there still isn't any work to do, shutdown the worker?
         }
 
         trace!("shutting down thread");
+
+        // Drain all work
+        self.drain_inbound();
+
+        loop {
+            match self.entry().deque.poll() {
+                Data(_) => {}
+                Empty => break,
+                Inconsistent => {},
+            }
+        }
 
         // TODO: Drain the work queue...
         self.inner.worker_terminated();
@@ -1159,7 +1182,10 @@ impl Worker {
                     // sleeper queue.
                     if let Err(_) = self.inner.push_sleeper(self.idx) {
                         // The push failed due to the pool being terminated.
-                        return false;
+                        //
+                        // This is true because the "work" being woken up for is
+                        // shutting down.
+                        return true;
                     }
                 }
 
@@ -1286,13 +1312,18 @@ impl State {
 
     /// Decrement the number of futures pending completion.
     fn dec_num_futures(&mut self) {
-        if self.0 & !1 == 0 {
+        if self.0 & !SHUTDOWN == 0 {
             // Already zero
             debug_assert_eq!(self.num_futures(), 0);
             return;
         }
 
         self.0 -= 2;
+    }
+
+    /// Set the number of futures pending completion to zero
+    fn clear_num_futures(&mut self) {
+        self.0 = self.0 & SHUTDOWN
     }
 
     /// Returns true if the shutdown flag is set
