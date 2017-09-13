@@ -870,15 +870,7 @@ impl Worker {
         }
 
         th.spawn(move || {
-            if let Some(ref f) = worker.inner.config.after_start {
-                f.call();
-            }
-
             worker.run();
-
-            if let Some(ref f) = worker.inner.config.before_stop {
-                f.call();
-            }
         }).unwrap();
     }
 
@@ -903,6 +895,10 @@ impl Worker {
 
     fn run2(&self) {
         use deque::Poll::*;
+
+        if let Some(ref f) = self.inner.config.after_start {
+            f.call();
+        }
 
         // Get the notifier.
         let notify = Arc::new(Notifier {
@@ -969,6 +965,10 @@ impl Worker {
                 Empty => break,
                 Inconsistent => {},
             }
+        }
+
+        if let Some(ref f) = self.inner.config.before_stop {
+            f.call();
         }
 
         // TODO: Drain the work queue...
