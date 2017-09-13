@@ -35,7 +35,6 @@ fn natural_shutdown_simple_futures() {
         let b = {
             let (t, rx) = mpsc::channel();
             tx.execute(lazy(move || {
-                println!("!!!!!!!!!!!!!!!!!!!!!! ");
                 // Makes sure this runs on a worker thread
                 FOO.with(|f| assert_eq!(f.get(), 0));
 
@@ -47,12 +46,8 @@ fn natural_shutdown_simple_futures() {
 
         drop(tx);
 
-        println!(" ++ try recv a");
         assert_eq!("one", a.recv().unwrap());
-        println!(" ++ try recv b");
         assert_eq!("two", b.recv().unwrap());
-
-        println!("~~~~~~~~~~~~~~");
 
         // Wait for the pool to shutdown
         pool.wait().unwrap();

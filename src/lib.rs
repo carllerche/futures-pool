@@ -70,12 +70,6 @@ struct Inner {
     // Stack tracking sleeping workers.
     sleep_stack: AtomicUsize,
 
-    // Number of outstanding `Sender` handles
-    //
-    // This is only used to track when to initiate shutdown due to all work
-    // being complete and no more work is able to be submitted.
-    num_senders: AtomicUsize,
-
     // Number of workers who haven't reached the final state of shutdown
     //
     // This is only used to know when to single `shutdown_task` once the
@@ -119,6 +113,12 @@ struct Notifier {
 #[derive(Eq, PartialEq, Clone, Copy)]
 struct State(usize);
 
+/// Flag used to track if the pool is running
+const SHUTDOWN: usize = 1;
+
+/// Max number of futures the pool can handle.
+const MAX_FUTURES: usize = usize::MAX >> 1;
+
 /// State related to the stack of sleeping workers.
 ///
 /// - Parked head     16 bits
@@ -128,7 +128,7 @@ struct State(usize);
 ///
 /// - EMPTY: No sleepers
 /// - TERMINATED: Don't spawn more threads
-#[derive(Deq, PartialEq, Clone, Copy)]
+#[derive(Eq, PartialEq, Clone, Copy)]
 struct SleepStack(usize);
 
 /// Extracts the head of the worker stack from the scheduler state
@@ -301,8 +301,7 @@ impl Builder {
 
         let inner = Arc::new(Inner {
             state: AtomicUsize::new(State::new().into()),
-            num_futures: AtomicUsize::new(0),
-            num_senders: AtomicUsize::new(1),
+            sleep_stack: AtomicUsize::new(SleepStack::new().into()),
             num_workers: AtomicUsize::new(self.pool_size),
             next_thread_id: AtomicUsize::new(0),
             workers: workers.into_boxed_slice(),
@@ -312,7 +311,7 @@ impl Builder {
 
         // Now, we prime the sleeper stack
         for i in 0..self.pool_size {
-            inner.push_sleeper(i)
+            inner.push_sleeper(i).unwrap();
         }
 
         let sender = Sender {
@@ -380,26 +379,16 @@ impl Future for Pool {
     fn poll(&mut self) -> Poll<(), ()> {
         trace!("Pool::poll");
 
+        // Implicitly shutdown...
+        self.shutdown();
+
         self.inner.shutdown_task.register();
-
-        unimplemented!();
-
-        /*
-        let state: State = self.inner.state.load(Acquire).into();
-
-        trace!("  -> is_stop={:?}; num_workers={}",
-               state.is_stop(), self.inner.num_workers.load(Acquire));
-
-        if !state.is_stop() {
-            return Ok(Async::NotReady);
-        }
 
         if 0 != self.inner.num_workers.load(Acquire) {
             return Ok(Async::NotReady);
         }
 
         Ok(().into())
-        */
     }
 }
 
@@ -412,7 +401,7 @@ impl<T> Executor<T> for Sender
     where T: Future<Item = (), Error = ()> + Send + 'static,
 {
     fn execute(&self, f: T) -> Result<(), ExecuteError<T>> {
-        use futures::future::ExecuteErrorKind::Shutdown;
+        use futures::future::ExecuteErrorKind::*;
 
         let mut state: State = self.inner.state.load(Acquire).into();
 
@@ -421,15 +410,23 @@ impl<T> Executor<T> for Sender
         loop {
             let mut next = state;
 
-            if !next.inc_num_futures() {
+            if next.num_futures() == MAX_FUTURES {
+                // No capacity
+                return Err(ExecuteError::new(NoCapacity, f));
+            }
+
+            if !next.is_running() {
                 // Cannot execute the future
                 return Err(ExecuteError::new(Shutdown, f));
             }
 
+            next.inc_num_futures();
+
             let actual = self.inner.state.compare_and_swap(
-                next.into(), state.into(), AcqRel).into();
+                state.into(), next.into(), AcqRel).into();
 
             if actual == state {
+                trace!("execute; count={:?}", next.num_futures());
                 break;
             }
 
@@ -453,34 +450,7 @@ impl Clone for Sender {
     #[inline]
     fn clone(&self) -> Sender {
         let inner = self.inner.clone();
-
-        // The clone above will panic if the inc below might overflow
-        inner.num_senders.fetch_add(1, Relaxed);
-
         Sender { inner }
-    }
-}
-
-impl Drop for Sender {
-    fn drop(&mut self) {
-        if self.inner.num_senders.fetch_sub(1, AcqRel) != 1 {
-            return;
-        }
-
-        let state: State = self.inner.state.load(Acquire).into();
-
-        if state.is_shutdown() {
-            // The pool is already in the process of shutting down
-            return;
-        }
-
-        if state.num_futures() != 0 {
-            // There are still futures that could potentially run
-            return;
-        }
-
-        // The pool can no longer do any work, so shut it down
-        self.inner.shutdown();
     }
 }
 
@@ -512,6 +482,8 @@ impl Inner {
     /// accepted.
     fn shutdown(&self) {
         let mut state: State = self.state.load(Acquire).into();
+
+        trace!("shutdown; state={:?}", state);
 
         // Start by setting the SHUTDOWN flag
         loop {
@@ -547,7 +519,7 @@ impl Inner {
 
         // Wakeup all sleeping workers. They will wake up, see the state
         // transition, and terminate.
-        while let Some((idx, worker_state)) = self.pop_sleeper(WORKER_SIGNALED) {
+        while let Some((idx, worker_state)) = self.pop_sleeper(WORKER_SIGNALED, TERMINATED) {
             trace!("shutdown worker; idx={:?}; state={:?}", idx, worker_state);
             self.signal_stop(idx, worker_state);
         }
@@ -630,7 +602,7 @@ impl Inner {
         trace!("submit_external");
         // First try to get a handle to a sleeping worker. This ensures that
         // sleeping tasks get woken up
-        if let Some((idx, state)) = self.pop_sleeper(WORKER_NOTIFIED) {
+        if let Some((idx, state)) = self.pop_sleeper(WORKER_NOTIFIED, EMPTY) {
             trace!("submit to existing worker; idx={}; state={:?}", idx, state);
             self.submit_to_external(idx, task, state, inner);
             return;
@@ -663,7 +635,7 @@ impl Inner {
     /// If there are any other workers currently relaxing, signal them that work
     /// is available so that they can try to find more work to process.
     fn signal_work(&self, inner: &Arc<Inner>) {
-        if let Some((idx, mut state)) = self.pop_sleeper(WORKER_SIGNALED) {
+        if let Some((idx, mut state)) = self.pop_sleeper(WORKER_SIGNALED, EMPTY) {
             let entry = &self.workers[idx];
 
             // Transition the worker state to signaled
@@ -987,8 +959,6 @@ impl Worker {
     fn check_run_state(&self, first: bool) -> bool {
         let mut state: WorkerState = self.entry().state.load(Acquire).into();
 
-        trace!("check_run_state");
-
         loop {
             let pool_state: State = self.inner.state.load(Acquire).into();
 
@@ -1076,8 +1046,32 @@ impl Worker {
     }
 
     fn run_task(&self, task: Task, notify: &Arc<Notifier>) {
-        if task.run(notify) {
-            self.entry().push_internal(task);
+        use task::Run::*;
+
+        match task.run(notify) {
+            Idle => {}
+            Schedule => {
+                self.entry().push_internal(task);
+            }
+            Complete => {
+                let mut state: State = self.inner.state.load(Acquire).into();
+
+                loop {
+                    let mut next = state;
+                    next.dec_num_futures();
+
+                    let actual = self.inner.state.compare_and_swap(
+                        state.into(), next.into(), AcqRel).into();
+
+                    if actual == state {
+                        // The worker's run loop will detect the shutdown state
+                        // next iteration.
+                        return;
+                    }
+
+                    state = actual;
+                }
+            }
         }
     }
 
@@ -1163,7 +1157,10 @@ impl Worker {
 
                     // We obtained permission to push the worker into the
                     // sleeper queue.
-                    self.inner.push_sleeper(self.idx);
+                    if let Err(_) = self.inner.push_sleeper(self.idx) {
+                        // The push failed due to the pool being terminated.
+                        return false;
+                    }
                 }
 
                 break;
@@ -1274,25 +1271,44 @@ impl State {
 
     /// Returns the number of futures still pending completion.
     fn num_futures(&self) -> usize {
-        unimplemented!();
+        self.0 >> 1
     }
 
     /// Increment the number of futures pending completion.
     ///
     /// Returns false on failure.
-    fn inc_num_futures(&mut self) -> bool {
-        unimplemented!();
+    fn inc_num_futures(&mut self) {
+        debug_assert!(self.num_futures() < MAX_FUTURES);
+        debug_assert!(self.is_running());
+
+        self.0 += 2;
+    }
+
+    /// Decrement the number of futures pending completion.
+    fn dec_num_futures(&mut self) {
+        if self.0 & !1 == 0 {
+            // Already zero
+            debug_assert_eq!(self.num_futures(), 0);
+            return;
+        }
+
+        self.0 -= 2;
     }
 
     /// Returns true if the shutdown flag is set
     fn is_shutdown(&self) -> bool {
-        unimplemented!();
+        self.0 & SHUTDOWN == SHUTDOWN
+    }
+
+    /// Returns true if not shutdown
+    fn is_running(&self) -> bool {
+        !self.is_shutdown()
     }
 
     /// Set the shutdown flag
     fn set_shutdown(&mut self) {
         debug_assert!(!self.is_shutdown());
-        unimplemented!();
+        self.0 |= SHUTDOWN;
     }
 }
 
@@ -1311,7 +1327,8 @@ impl From<State> for usize {
 impl fmt::Debug for State {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("State")
-            // TODO: implement
+            .field("is_shutdown", &self.is_shutdown())
+            .field("num_futures", &self.num_futures())
             .finish()
     }
 }
@@ -1321,7 +1338,7 @@ impl fmt::Debug for State {
 impl SleepStack {
     #[inline]
     fn new() -> SleepStack {
-        State(EMPTY)
+        SleepStack(EMPTY)
     }
 
     #[inline]
@@ -1331,7 +1348,6 @@ impl SleepStack {
 
     #[inline]
     fn set_head(&mut self, val: usize) {
-        assert!(val < MAX_WORKERS);
         // The ABA guard protects against the ABA problem w/ treiber stacks
         let aba_guard = ((self.0 >> ABA_GUARD_SHIFT) + 1) & ABA_GUARD_MASK;
 
@@ -1358,11 +1374,11 @@ impl fmt::Debug for SleepStack {
         let mut fmt = fmt.debug_struct("SleepStack");
 
         if head < MAX_WORKERS {
-            fmt.field("head", &head)
+            fmt.field("head", &head);
         } else if head == EMPTY {
-            fmt.field("head", &"EMPTY")
+            fmt.field("head", &"EMPTY");
         } else if head == TERMINATED {
-            fmt.field("head", &"TERMINATED")
+            fmt.field("head", &"TERMINATED");
         }
 
         fmt.finish()
