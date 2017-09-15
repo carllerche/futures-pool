@@ -27,6 +27,13 @@ pub(crate) enum Poll {
     Data(Task),
 }
 
+#[derive(Debug)]
+pub(crate) enum Run {
+    Idle,
+    Schedule,
+    Complete,
+}
+
 struct Inner {
     // Next pointer in the queue that submits tasks to a worker.
     next: AtomicPtr<Inner>,
@@ -87,7 +94,7 @@ impl Task {
     }
 
     /// Execute the task returning `true` if the task needs to be scheduled again.
-    pub fn run(&self, unpark: &Arc<Notifier>) -> bool {
+    pub fn run(&self, unpark: &Arc<Notifier>) -> Run {
         use self::State::*;
 
         // Transition task to running state. At this point, the task must be
@@ -115,7 +122,7 @@ impl Task {
                 // Transition to the completed state
                 self.inner().state.store(State::Complete.into(), Release);
 
-                false
+                Run::Complete
             }
             _ => {
                 trace!("    -> not ready");
@@ -129,10 +136,10 @@ impl Task {
                     Running.into(), Idle.into(), AcqRel).into();
 
                 match prev {
-                    Running => false,
+                    Running => Run::Idle,
                     Notified => {
                         self.inner().state.store(Scheduled.into(), Release);
-                        true
+                        Run::Schedule
                     }
                     _ => unreachable!(),
                 }

@@ -15,9 +15,10 @@ mod task;
 use deque::Deque;
 use task::Task;
 
-use futures::Future;
+use futures::{Future, Poll, Async};
 use futures::executor::Notify;
 use futures::future::{Executor, ExecuteError};
+use futures::task::AtomicTask;
 
 use rand::{Rng, SeedableRng, XorShiftRng};
 
@@ -64,12 +65,16 @@ struct Config {
 #[derive(Debug)]
 struct Inner {
     // Pool state
-    //
-    // Tracks:
-    // * Total worker count
-    // * Active worker count
-    // * Pool lifecycle
     state: AtomicUsize,
+
+    // Stack tracking sleeping workers.
+    sleep_stack: AtomicUsize,
+
+    // Number of workers who haven't reached the final state of shutdown
+    //
+    // This is only used to know when to single `shutdown_task` once the
+    // shutdown process has completed.
+    num_workers: AtomicUsize,
 
     // Used to generate a thread local RNG seed
     next_thread_id: AtomicUsize,
@@ -78,6 +83,9 @@ struct Inner {
     //
     // This will *usually* be a small number
     workers: Box<[WorkerEntry]>,
+
+    // Task notified when the worker shuts down
+    shutdown_task: AtomicTask,
 
     // Configuration
     config: Config,
@@ -97,45 +105,48 @@ struct Notifier {
     inner: Weak<Inner>,
 }
 
-/// Pool state packed into an AtomicUsize
+/// Pool state.
 ///
-/// Tracks:
-/// - Lifecycle        2 bits
-/// - Parked head     15 bits
-/// - Sequence        remaining
-#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+/// The least significant bit is a flag indicating if the pool is shutting down
+/// (0 for active, 1 for shutting down). The remaining bits represent the number
+/// of futures that still need to complete.
+#[derive(Eq, PartialEq, Clone, Copy)]
 struct State(usize);
 
-/// Extracts the lifecycle component from the scheduler state
-const LIFECYCLE_MASK: usize = 0b11;
+/// Flag used to track if the pool is running
+const SHUTDOWN: usize = 1;
 
-/// The scheduler is running
-const RUNNING: usize = 0b00;
+/// Max number of futures the pool can handle.
+const MAX_FUTURES: usize = usize::MAX >> 1;
 
-/*
-/// The scheduler is shutting down
-const SHUTDOWN: usize = 0b01;
-
-/// The scheduler has stopped, this is more aggressive than shutdown.
-const STOP: usize = 0b10;
-
-/// The scheduler has terminated
-const TERMINATED: usize = 0b11;
-*/
+/// State related to the stack of sleeping workers.
+///
+/// - Parked head     16 bits
+/// - Sequence        remaining
+///
+/// The parked head value has a couple of special values:
+///
+/// - EMPTY: No sleepers
+/// - TERMINATED: Don't spawn more threads
+#[derive(Eq, PartialEq, Clone, Copy)]
+struct SleepStack(usize);
 
 /// Extracts the head of the worker stack from the scheduler state
-const STACK_MASK: usize = ((1 << 15) - 1) << STACK_SHIFT;
+const STACK_MASK: usize = ((1 << 16) - 1);
 
 /// Max number of workers that can be part of a pool. This is the most that can
 /// fit in the scheduler state. Note, that this is the max number of **active**
 /// threads. There can be more standby threads.
-const MAX_WORKERS: usize = 1 << 14;
+const MAX_WORKERS: usize = 1 << 15;
 
-/// How many bits the stack head index is offset
-const STACK_SHIFT: usize = 2;
+/// Used to mark the stack as empty
+const EMPTY: usize = MAX_WORKERS;
+
+/// Used to mark the stack as terminated
+const TERMINATED: usize = EMPTY + 1;
 
 /// How many bits the treiber ABA guard is offset by
-const ABA_GUARD_SHIFT: usize = 15 + 2;
+const ABA_GUARD_SHIFT: usize = 16;
 
 #[cfg(target_pointer_width = "64")]
 const ABA_GUARD_MASK: usize = (1 << (64 - ABA_GUARD_SHIFT)) - 1;
@@ -171,7 +182,7 @@ struct WorkerEntry {
 }
 
 /// Tracks worker state
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct WorkerState(usize);
 
 /// Set when the worker is pushed onto the scheduler's stack of sleeping
@@ -214,7 +225,7 @@ thread_local!(static CURRENT_WORKER: Cell<*const Worker> = Cell::new(0 as *const
 
 impl Builder {
     /// Returns a builder with default values
-    pub fn new() -> Builder {
+    fn new() -> Builder {
         let num_cpus = num_cpus::get();
 
         Builder {
@@ -290,14 +301,17 @@ impl Builder {
 
         let inner = Arc::new(Inner {
             state: AtomicUsize::new(State::new().into()),
+            sleep_stack: AtomicUsize::new(SleepStack::new().into()),
+            num_workers: AtomicUsize::new(self.pool_size),
             next_thread_id: AtomicUsize::new(0),
             workers: workers.into_boxed_slice(),
+            shutdown_task: AtomicTask::new(),
             config: self.config.clone(),
         });
 
         // Now, we prime the sleeper stack
         for i in 0..self.pool_size {
-            inner.push_sleeper(i)
+            inner.push_sleeper(i).unwrap();
         }
 
         let sender = Sender {
@@ -318,6 +332,11 @@ impl Pool {
     /// Create a new Pool with default configuration.
     pub fn new() -> (Sender, Pool) {
         Builder::new().build()
+    }
+
+    /// Build a Pool with custom settings
+    pub fn builder() -> Builder {
+        Builder::new()
     }
 
     /// Start a core thread, causing it to idly wait for work.
@@ -342,6 +361,40 @@ impl Pool {
         let state: State = self.inner.state.load(Relaxed).into();
         state.is_running()
     }
+
+    /// Shutdown the pool
+    ///
+    /// Perform an orderly shutdown.
+    pub fn shutdown(&mut self) {
+        self.inner.shutdown(false);
+    }
+
+    /// Shutdown the pool immediately
+    ///
+    /// All queued futures are dropped.
+    pub fn force_shutdown(&mut self) {
+        self.inner.shutdown(true);
+    }
+}
+
+impl Future for Pool {
+    type Item = ();
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<(), ()> {
+        trace!("Pool::poll");
+
+        // Implicitly shutdown...
+        self.shutdown();
+
+        self.inner.shutdown_task.register();
+
+        if 0 != self.inner.num_workers.load(Acquire) {
+            return Ok(Async::NotReady);
+        }
+
+        Ok(().into())
+    }
 }
 
 // ===== impl Sender ======
@@ -353,9 +406,47 @@ impl<T> Executor<T> for Sender
     where T: Future<Item = (), Error = ()> + Send + 'static,
 {
     fn execute(&self, f: T) -> Result<(), ExecuteError<T>> {
+        use futures::future::ExecuteErrorKind::*;
+
+        let mut state: State = self.inner.state.load(Acquire).into();
+
+        // Increment the number of futures spawned on the pool as well as
+        // validate that the pool is still running/
+        loop {
+            let mut next = state;
+
+            if next.num_futures() == MAX_FUTURES {
+                // No capacity
+                return Err(ExecuteError::new(NoCapacity, f));
+            }
+
+            if !next.is_running() {
+                // Cannot execute the future
+                return Err(ExecuteError::new(Shutdown, f));
+            }
+
+            next.inc_num_futures();
+
+            let actual = self.inner.state.compare_and_swap(
+                state.into(), next.into(), AcqRel).into();
+
+            if actual == state {
+                trace!("execute; count={:?}", next.num_futures());
+                break;
+            }
+
+            state = actual;
+        }
+
+        // At this point, the pool has accepted the future, so schedule it for
+        // execution.
+
+        // Create a new task for the future
         let task = Task::new(f);
+
         // TODO: handle the error
         let _ = self.inner.submit(task, &self.inner);
+
         Ok(())
     }
 }
@@ -363,9 +454,8 @@ impl<T> Executor<T> for Sender
 impl Clone for Sender {
     #[inline]
     fn clone(&self) -> Sender {
-        Sender {
-            inner: self.inner.clone(),
-        }
+        let inner = self.inner.clone();
+        Sender { inner }
     }
 }
 
@@ -393,13 +483,109 @@ macro_rules! worker_loop {
 }
 
 impl Inner {
+    /// Start shutting down the pool. This means that no new futures will be
+    /// accepted.
+    fn shutdown(&self, force: bool) {
+        let mut state: State = self.state.load(Acquire).into();
+
+        trace!("shutdown; state={:?}", state);
+
+        // Start by setting the SHUTDOWN flag
+        loop {
+            let mut next = state;
+
+            if next.is_shutdown() {
+                // Already transitioned to shutting down state
+                return;
+            }
+
+            next.set_shutdown();
+
+            if force {
+                next.clear_num_futures();
+            }
+
+            let actual = self.state.compare_and_swap(
+                state.into(), next.into(), AcqRel).into();
+
+            if state == actual {
+                state = next;
+                break;
+            }
+
+            state = actual;
+        }
+
+        trace!("  -> transitioned to shutdown");
+
+        // Only transition to terminate if there are no futures currently on the
+        // pool
+        if state.num_futures() != 0 {
+            return;
+        }
+
+        trace!("  -> shutting down workers");
+
+        // Wakeup all sleeping workers. They will wake up, see the state
+        // transition, and terminate.
+        while let Some((idx, worker_state)) = self.pop_sleeper(WORKER_SIGNALED, TERMINATED) {
+            trace!("shutdown worker; idx={:?}; state={:?}", idx, worker_state);
+            self.signal_stop(idx, worker_state);
+        }
+    }
+
+    /// Signals to the worker that it should stop
+    fn signal_stop(&self, worker: usize, mut state: WorkerState) {
+        let worker = &self.workers[worker];
+
+        // Transition the worker state to signaled
+        loop {
+            let mut next = state;
+
+            if state.lifecycle() == WORKER_SHUTDOWN {
+                // If the worker is in the shutdown state, then it will never be
+                // started again.
+                self.worker_terminated();
+
+                return;
+            } else if state.lifecycle() != WORKER_SLEEPING {
+                // All other states will naturally converge to a state of
+                // shutdown.
+                return;
+            }
+
+            next.set_lifecycle(WORKER_SIGNALED);
+
+            let actual = worker.state.compare_and_swap(
+                state.into(), next.into(), AcqRel).into();
+
+            if actual == state {
+                break;
+            }
+
+            state = actual;
+        }
+
+        // Wakeup the worker
+        worker.wakeup();
+    }
+
+    fn worker_terminated(&self) {
+        let prev = self.num_workers.fetch_sub(1, AcqRel);
+
+        trace!("worker_terminated; num_workers={}", prev - 1);
+
+        if 1 == prev {
+            trace!("notifying shutdown task");
+            self.shutdown_task.notify();
+        }
+    }
+
     /// Submit a task to the scheduler.
     ///
     /// Called from either inside or outside of the scheduler. If currently on
     /// the scheduler, then a fast path is taken.
     fn submit(&self, task: Task, inner: &Arc<Inner>) -> Result<(), Task> {
-        // TODO: Check if the scheduler is still running.
-
         Worker::with_current(|worker| {
             match worker {
                 Some(worker) => {
@@ -422,9 +608,11 @@ impl Inner {
     /// Called from outside of the scheduler, this function is how new tasks
     /// enter the system.
     fn submit_external(&self, task: Task, inner: &Arc<Inner>) {
+        trace!("submit_external");
         // First try to get a handle to a sleeping worker. This ensures that
         // sleeping tasks get woken up
-        if let Some((idx, state)) = self.pop_sleeper(WORKER_NOTIFIED) {
+        if let Some((idx, state)) = self.pop_sleeper(WORKER_NOTIFIED, EMPTY) {
+            trace!("submit to existing worker; idx={}; state={:?}", idx, state);
             self.submit_to_external(idx, task, state, inner);
             return;
         }
@@ -433,6 +621,8 @@ impl Inner {
         // task to it.
         let len = self.workers.len();
         let idx = self.rand_usize() % len;
+
+        trace!("  -> submitting to random; idx={}", idx);
 
         let state: WorkerState = self.workers[idx].state.load(Acquire).into();
         self.submit_to_external(idx, task, state, inner);
@@ -454,7 +644,7 @@ impl Inner {
     /// If there are any other workers currently relaxing, signal them that work
     /// is available so that they can try to find more work to process.
     fn signal_work(&self, inner: &Arc<Inner>) {
-        if let Some((idx, mut state)) = self.pop_sleeper(WORKER_SIGNALED) {
+        if let Some((idx, mut state)) = self.pop_sleeper(WORKER_SIGNALED, EMPTY) {
             let entry = &self.workers[idx];
 
             // Transition the worker state to signaled
@@ -489,42 +679,68 @@ impl Inner {
         }
     }
 
-    fn push_sleeper(&self, idx: usize) {
-        let mut state: State = self.state.load(Acquire).into();
+    /// Push a worker on the sleep stack
+    ///
+    /// Returns `Err` if the pool has been terminated
+    fn push_sleeper(&self, idx: usize) -> Result<(), ()> {
+        let mut state: SleepStack = self.sleep_stack.load(Acquire).into();
 
         debug_assert!(WorkerState::from(self.workers[idx].state.load(Relaxed)).is_pushed());
 
         loop {
             let mut next = state;
 
-            self.workers[idx].set_next_sleeper(state.sleeper_head());
-            next.set_sleeper_head(idx);
+            let head = state.head();
 
-            let actual = self.state.compare_and_swap(
+            if head == TERMINATED {
+                // The pool is terminated, cannot push the sleeper.
+                return Err(());
+            }
+
+            self.workers[idx].set_next_sleeper(head);
+            next.set_head(idx);
+
+            let actual = self.sleep_stack.compare_and_swap(
                 state.into(), next.into(), AcqRel).into();
 
             if state == actual {
-                return;
+                return Ok(());
             }
 
             state = actual;
         }
     }
 
-    fn pop_sleeper(&self, max_lifecycle: usize) -> Option<(usize, WorkerState)> {
-        let mut state: State = self.state.load(Acquire).into();
+    /// Pop a worker from the sleep stack
+    fn pop_sleeper(&self, max_lifecycle: usize, terminal: usize)
+        -> Option<(usize, WorkerState)>
+    {
+        debug_assert!(terminal == EMPTY || terminal == TERMINATED);
+
+        let mut state: SleepStack = self.sleep_stack.load(Acquire).into();
 
         loop {
-            let head = state.sleeper_head();
+            let head = state.head();
 
-            if head == MAX_WORKERS {
+            // All values greater than MAX_WORKERS are terminals
+            if head >= MAX_WORKERS {
                 return None;
             }
 
             let mut next = state;
-            next.set_sleeper_head(self.workers[head].next_sleeper());
 
-            let actual = self.state.compare_and_swap(
+            let next_head = self.workers[head].next_sleeper();
+
+            // TERMINATED can never be set as the "next pointer" on a worker.
+            debug_assert!(next_head != TERMINATED);
+
+            if next_head == EMPTY {
+                next.set_head(terminal);
+            } else {
+                next.set_head(next_head);
+            }
+
+            let actual = self.sleep_stack.compare_and_swap(
                 state.into(), next.into(), AcqRel).into();
 
             if actual == state {
@@ -603,6 +819,8 @@ impl Notify for Notifier {
             return;
         }
 
+        // TODO: Check if the pool is still running
+
         // Bump the ref count
         let task = task.clone();
 
@@ -652,15 +870,7 @@ impl Worker {
         }
 
         th.spawn(move || {
-            if let Some(ref f) = worker.inner.config.after_start {
-                f.call();
-            }
-
             worker.run();
-
-            if let Some(ref f) = worker.inner.config.before_stop {
-                f.call();
-            }
         }).unwrap();
     }
 
@@ -684,10 +894,13 @@ impl Worker {
     }
 
     fn run2(&self) {
+        use deque::Poll::*;
+
+        if let Some(ref f) = self.inner.config.after_start {
+            f.call();
+        }
+
         // Get the notifier.
-        //
-        // TODO: Should this be shared across workers? Probably doesn't matter
-        // much?
         let notify = Arc::new(Notifier {
             inner: Arc::downgrade(&self.inner),
         });
@@ -731,11 +944,35 @@ impl Worker {
                 // Yield the thread
                 thread::yield_now();
             } else {
-                self.sleep();
+                if !self.sleep() {
+                    // The sleep expired and now the worker should shutdown due
+                    // to being idle.
+                    unimplemented!();
+                }
             }
 
             // If there still isn't any work to do, shutdown the worker?
         }
+
+        trace!("shutting down thread");
+
+        // Drain all work
+        self.drain_inbound();
+
+        loop {
+            match self.entry().deque.poll() {
+                Data(_) => {}
+                Empty => break,
+                Inconsistent => {},
+            }
+        }
+
+        if let Some(ref f) = self.inner.config.before_stop {
+            f.call();
+        }
+
+        // TODO: Drain the work queue...
+        self.inner.worker_terminated();
     }
 
     /// Checks the worker's current state, updating it as needed.
@@ -746,8 +983,12 @@ impl Worker {
         let mut state: WorkerState = self.entry().state.load(Acquire).into();
 
         loop {
-            // TODO: ensure scheduler still running
-            //
+            let pool_state: State = self.inner.state.load(Acquire).into();
+
+            if !pool_state.is_running() && pool_state.num_futures() == 0 {
+                return false;
+            }
+
             let mut next = state;
 
             match state.lifecycle() {
@@ -828,8 +1069,32 @@ impl Worker {
     }
 
     fn run_task(&self, task: Task, notify: &Arc<Notifier>) {
-        if task.run(notify) {
-            self.entry().push_internal(task);
+        use task::Run::*;
+
+        match task.run(notify) {
+            Idle => {}
+            Schedule => {
+                self.entry().push_internal(task);
+            }
+            Complete => {
+                let mut state: State = self.inner.state.load(Acquire).into();
+
+                loop {
+                    let mut next = state;
+                    next.dec_num_futures();
+
+                    let actual = self.inner.state.compare_and_swap(
+                        state.into(), next.into(), AcqRel).into();
+
+                    if actual == state {
+                        // The worker's run loop will detect the shutdown state
+                        // next iteration.
+                        return;
+                    }
+
+                    state = actual;
+                }
+            }
         }
     }
 
@@ -869,6 +1134,7 @@ impl Worker {
             }
         }
     }
+
     /// Put the worker to sleep
     ///
     /// Returns `true` if woken up due to new work arriving.
@@ -914,7 +1180,13 @@ impl Worker {
 
                     // We obtained permission to push the worker into the
                     // sleeper queue.
-                    self.inner.push_sleeper(self.idx);
+                    if let Err(_) = self.inner.push_sleeper(self.idx) {
+                        // The push failed due to the pool being terminated.
+                        //
+                        // This is true because the "work" being woken up for is
+                        // shutting down.
+                        return true;
+                    }
                 }
 
                 break;
@@ -1020,37 +1292,54 @@ impl Worker {
 impl State {
     #[inline]
     fn new() -> State {
-        let ret = State(MAX_WORKERS << STACK_SHIFT);
-
-        debug_assert!(ret.is_running());
-        debug_assert_eq!(ret.sleeper_head(), MAX_WORKERS);
-
-        ret
+        State(0)
     }
 
-    #[inline]
-    fn lifecycle(&self) -> usize {
-        self.0 & LIFECYCLE_MASK
+    /// Returns the number of futures still pending completion.
+    fn num_futures(&self) -> usize {
+        self.0 >> 1
     }
 
-    #[inline]
+    /// Increment the number of futures pending completion.
+    ///
+    /// Returns false on failure.
+    fn inc_num_futures(&mut self) {
+        debug_assert!(self.num_futures() < MAX_FUTURES);
+        debug_assert!(self.is_running());
+
+        self.0 += 2;
+    }
+
+    /// Decrement the number of futures pending completion.
+    fn dec_num_futures(&mut self) {
+        if self.0 & !SHUTDOWN == 0 {
+            // Already zero
+            debug_assert_eq!(self.num_futures(), 0);
+            return;
+        }
+
+        self.0 -= 2;
+    }
+
+    /// Set the number of futures pending completion to zero
+    fn clear_num_futures(&mut self) {
+        self.0 = self.0 & SHUTDOWN
+    }
+
+    /// Returns true if the shutdown flag is set
+    fn is_shutdown(&self) -> bool {
+        self.0 & SHUTDOWN == SHUTDOWN
+    }
+
+    /// Returns true if not shutdown
     fn is_running(&self) -> bool {
-        self.lifecycle() == RUNNING
+        !self.is_shutdown()
     }
 
-    #[inline]
-    fn sleeper_head(&self) -> usize {
-        (self.0 & STACK_MASK) >> STACK_SHIFT
-    }
-
-    #[inline]
-    fn set_sleeper_head(&mut self, val: usize) {
-        // The ABA guard protects against the ABA problem w/ treiber stacks
-        let aba_guard = ((self.0 >> ABA_GUARD_SHIFT) + 1) & ABA_GUARD_MASK;
-
-        self.0 = (aba_guard << ABA_GUARD_SHIFT) |
-            (val << STACK_SHIFT) |
-            self.lifecycle();
+    /// Set the shutdown flag
+    fn set_shutdown(&mut self) {
+        debug_assert!(!self.is_shutdown());
+        self.0 |= SHUTDOWN;
     }
 }
 
@@ -1063,6 +1352,67 @@ impl From<usize> for State {
 impl From<State> for usize {
     fn from(src: State) -> Self {
         src.0
+    }
+}
+
+impl fmt::Debug for State {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.debug_struct("State")
+            .field("is_shutdown", &self.is_shutdown())
+            .field("num_futures", &self.num_futures())
+            .finish()
+    }
+}
+
+// ===== impl SleepStack =====
+
+impl SleepStack {
+    #[inline]
+    fn new() -> SleepStack {
+        SleepStack(EMPTY)
+    }
+
+    #[inline]
+    fn head(&self) -> usize {
+        self.0 & STACK_MASK
+    }
+
+    #[inline]
+    fn set_head(&mut self, val: usize) {
+        // The ABA guard protects against the ABA problem w/ treiber stacks
+        let aba_guard = ((self.0 >> ABA_GUARD_SHIFT) + 1) & ABA_GUARD_MASK;
+
+        self.0 = (aba_guard << ABA_GUARD_SHIFT) | val;
+    }
+}
+
+impl From<usize> for SleepStack {
+    fn from(src: usize) -> Self {
+        SleepStack(src)
+    }
+}
+
+impl From<SleepStack> for usize {
+    fn from(src: SleepStack) -> Self {
+        src.0
+    }
+}
+
+impl fmt::Debug for SleepStack {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        let head = self.head();
+
+        let mut fmt = fmt.debug_struct("SleepStack");
+
+        if head < MAX_WORKERS {
+            fmt.field("head", &head);
+        } else if head == EMPTY {
+            fmt.field("head", &"EMPTY");
+        } else if head == TERMINATED {
+            fmt.field("head", &"TERMINATED");
+        }
+
+        fmt.finish()
     }
 }
 
@@ -1204,6 +1554,15 @@ impl From<usize> for WorkerState {
 impl From<WorkerState> for usize {
     fn from(src: WorkerState) -> Self {
         src.0
+    }
+}
+
+impl fmt::Debug for WorkerState {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.debug_struct("WorkerState")
+            .field("lifecycle", &self.lifecycle())
+            .field("is_pushed", &self.is_pushed())
+            .finish()
     }
 }
 
