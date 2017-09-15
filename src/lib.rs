@@ -27,7 +27,7 @@ use std::cell::{Cell, UnsafeCell};
 use std::sync::{Arc, Weak, Mutex, Condvar};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Release, Relaxed};
-use std::time::Duration;
+use std::time::{Instant, Duration};
 
 /// Thread pool
 #[derive(Debug)]
@@ -980,7 +980,11 @@ impl Worker {
                 if !self.sleep() {
                     // The sleep expired and now the worker should shutdown due
                     // to being idle.
-                    unimplemented!();
+                    if let Some(ref f) = self.inner.config.before_stop {
+                        f.call();
+                    }
+
+                    return;
                 }
             }
 
@@ -1300,38 +1304,79 @@ impl Worker {
 
         trace!("    -> starting to sleep; idx={}", self.idx);
 
+        let sleep_until = self.inner.config.keep_alive
+            .map(|dur| Instant::now() + dur);
+
         // The state has been transitioned to sleeping, we can now wait on the
         // condvar. This is done in a loop as condvars can wakeup spuriously.
         loop {
-            lock = self.entry().park_condvar.wait(lock).unwrap();
+            let mut drop_thread = false;
+
+            lock = match sleep_until {
+                Some(when) => {
+                    let now = Instant::now();
+
+                    if when >= now {
+                        drop_thread = true;
+                    }
+
+                    let dur = when - now;
+
+                    self.entry().park_condvar
+                        .wait_timeout(lock, dur)
+                        .unwrap().0
+                }
+                None => {
+                    self.entry().park_condvar.wait(lock).unwrap()
+                }
+            };
 
             trace!("    -> wakeup; idx={}", self.idx);
 
             // Reload the state
             state = self.entry().state.load(Acquire).into();
 
-            match state.lifecycle() {
-                WORKER_SLEEPING => {}
-                WORKER_NOTIFIED | WORKER_SIGNALED => {
-                    // Release the lock, done sleeping
-                    drop(lock);
+            loop {
+                match state.lifecycle() {
+                    WORKER_SLEEPING => {}
+                    WORKER_NOTIFIED | WORKER_SIGNALED => {
+                        // Release the lock, done sleeping
+                        drop(lock);
 
-                    // Transition back to running
-                    loop {
-                        let mut next = state;
-                        next.set_lifecycle(WORKER_RUNNING);
+                        // Transition back to running
+                        loop {
+                            let mut next = state;
+                            next.set_lifecycle(WORKER_RUNNING);
 
-                        let actual = self.entry().state.compare_and_swap(
-                            state.into(), next.into(), AcqRel).into();
+                            let actual = self.entry().state.compare_and_swap(
+                                state.into(), next.into(), AcqRel).into();
 
-                        if actual == state {
-                            return true;
+                            if actual == state {
+                                return true;
+                            }
+
+                            state = actual;
                         }
-
-                        state = actual;
                     }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
+
+                if !drop_thread {
+                    break;
+                }
+
+                let mut next = state;
+                next.set_lifecycle(WORKER_SHUTDOWN);
+
+                let actual = self.entry().state.compare_and_swap(
+                    state.into(), next.into(), AcqRel).into();
+
+                if actual == state {
+                    // Transitioned to a shutdown state
+                    return false;
+                }
+
+                state = actual;
             }
 
             // The worker hasn't been notified, go back to sleep
