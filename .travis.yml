@@ -2,8 +2,6 @@
 language: rust
 sudo: false
 
-cache: cargo
-
 matrix:
   include:
     # Minimum rustc version
