@@ -102,6 +102,8 @@ impl Task {
         let actual: State = self.inner().state.compare_and_swap(
             Scheduled.into(), Running.into(), AcqRel).into();
 
+        trace!("running; state={:?}", actual);
+
         match actual {
             Scheduled => {},
             _ => panic!("unexpected task state; {:?}", actual),
