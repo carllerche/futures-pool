@@ -295,6 +295,8 @@ impl Builder {
     pub fn build(&self) -> (Sender, Pool) {
         let mut workers = vec![];
 
+        trace!("build; num-workers={}", self.pool_size);
+
         for _ in 0..self.pool_size {
             workers.push(WorkerEntry::new());
         }
@@ -524,34 +526,43 @@ impl Inner {
             return;
         }
 
-        trace!("  -> shutting down workers");
+        self.terminate_sleeping_workers();
+    }
 
+    fn terminate_sleeping_workers(&self) {
+        trace!("  -> shutting down workers");
         // Wakeup all sleeping workers. They will wake up, see the state
         // transition, and terminate.
         while let Some((idx, worker_state)) = self.pop_sleeper(WORKER_SIGNALED, TERMINATED) {
-            trace!("shutdown worker; idx={:?}; state={:?}", idx, worker_state);
+            trace!("  -> shutdown worker; idx={:?}; state={:?}", idx, worker_state);
             self.signal_stop(idx, worker_state);
         }
     }
 
     /// Signals to the worker that it should stop
-    fn signal_stop(&self, worker: usize, mut state: WorkerState) {
-        let worker = &self.workers[worker];
+    fn signal_stop(&self, idx: usize, mut state: WorkerState) {
+        let worker = &self.workers[idx];
 
         // Transition the worker state to signaled
         loop {
             let mut next = state;
 
-            if state.lifecycle() == WORKER_SHUTDOWN {
-                // If the worker is in the shutdown state, then it will never be
-                // started again.
-                self.worker_terminated();
+            match state.lifecycle() {
+                WORKER_SHUTDOWN => {
+                    trace!("signal_stop -- WORKER_SHUTDOWN; idx={}", idx);
+                    // If the worker is in the shutdown state, then it will never be
+                    // started again.
+                    self.worker_terminated();
 
-                return;
-            } else if state.lifecycle() != WORKER_SLEEPING {
-                // All other states will naturally converge to a state of
-                // shutdown.
-                return;
+                    return;
+                }
+                WORKER_RUNNING | WORKER_SLEEPING => {}
+                _ => {
+                    trace!("signal_stop -- skipping; idx={}; state={:?}", idx, state);
+                    // All other states will naturally converge to a state of
+                    // shutdown.
+                    return;
+                }
             }
 
             next.set_lifecycle(WORKER_SIGNALED);
@@ -589,8 +600,10 @@ impl Inner {
         Worker::with_current(|worker| {
             match worker {
                 Some(worker) => {
-                    trace!("    -> submit internal");
                     let idx = worker.idx;
+
+                    trace!("    -> submit internal; idx={}", idx);
+
                     worker.inner.workers[idx].submit_internal(task);
                     worker.inner.signal_work(inner);
                 }
@@ -608,7 +621,6 @@ impl Inner {
     /// Called from outside of the scheduler, this function is how new tasks
     /// enter the system.
     fn submit_external(&self, task: Task, inner: &Arc<Inner>) {
-        trace!("submit_external");
         // First try to get a handle to a sleeping worker. This ensures that
         // sleeping tasks get woken up
         if let Some((idx, state)) = self.pop_sleeper(WORKER_NOTIFIED, EMPTY) {
@@ -669,9 +681,11 @@ impl Inner {
             // the worker if necessary.
             match state.lifecycle() {
                 WORKER_SLEEPING => {
+                    trace!("signal_work -- wakeup; idx={}", idx);
                     self.workers[idx].wakeup();
                 }
                 WORKER_SHUTDOWN => {
+                    trace!("signal_work -- spawn; idx={}", idx);
                     Worker::spawn(idx, inner);
                 }
                 _ => {}
@@ -722,10 +736,29 @@ impl Inner {
         loop {
             let head = state.head();
 
-            // All values greater than MAX_WORKERS are terminals
-            if head >= MAX_WORKERS {
+            if head == EMPTY {
+                let mut next = state;
+                next.set_head(terminal);
+
+                if next == state {
+                    debug_assert!(terminal == EMPTY);
+                    return None;
+                }
+
+                let actual = self.sleep_stack.compare_and_swap(
+                    state.into(), next.into(), AcqRel).into();
+
+                if actual != state {
+                    state = actual;
+                    continue;
+                }
+
+                return None;
+            } else if head == TERMINATED {
                 return None;
             }
+
+            debug_assert!(head < MAX_WORKERS);
 
             let mut next = state;
 
@@ -852,7 +885,7 @@ unsafe impl Sync for Inner {}
 
 impl Worker {
     fn spawn(idx: usize, inner: &Arc<Inner>) {
-        trace!("spawning new worker thread");
+        trace!("spawning new worker thread; idx={}", idx);
 
         let worker = Worker {
             inner: inner.clone(),
@@ -954,7 +987,7 @@ impl Worker {
             // If there still isn't any work to do, shutdown the worker?
         }
 
-        trace!("shutting down thread");
+        trace!("shutting down thread; idx={}", self.idx);
 
         // Drain all work
         self.drain_inbound();
@@ -1013,6 +1046,7 @@ impl Worker {
         // If this is the first iteration of the worker loop, then the state can
         // be signaled.
         if !first && state.is_signaled() {
+            trace!("Worker::check_run_state; delegate signal");
             // This worker is not ready to be signaled, so delegate the signal
             // to another worker.
             self.inner.signal_work(&self.inner);
@@ -1053,7 +1087,12 @@ impl Worker {
         worker_loop!(idx = len; len; {
             match self.inner.workers[idx].deque.poll() {
                 Data(task) => {
+                    trace!("stole task");
+
                     self.run_task(task, notify);
+
+                    trace!("try_steal_task -- signal_work; self={}; from={}",
+                           self.idx, idx);
 
                     // Signal other workers that work is available
                     self.inner.signal_work(&self.inner);
@@ -1087,6 +1126,16 @@ impl Worker {
                         state.into(), next.into(), AcqRel).into();
 
                     if actual == state {
+                        trace!("task complete; state={:?}", next);
+
+                        if !next.is_shutdown() {
+                            return;
+                        }
+
+                        if state.num_futures() == 1 && next.num_futures() == 0 {
+                            self.inner.terminate_sleeping_workers();
+                        }
+
                         // The worker's run loop will detect the shutdown state
                         // next iteration.
                         return;
@@ -1115,6 +1164,7 @@ impl Worker {
             match task {
                 Empty => {
                     if found_work {
+                        trace!("found work while draining; signal_work");
                         self.inner.signal_work(&self.inner);
                     }
 
@@ -1122,6 +1172,7 @@ impl Worker {
                 }
                 Inconsistent => {
                     if found_work {
+                        trace!("found work while draining; signal_work");
                         self.inner.signal_work(&self.inner);
                     }
 
@@ -1140,7 +1191,7 @@ impl Worker {
     /// Returns `true` if woken up due to new work arriving.
     #[inline]
     fn sleep(&self) -> bool {
-        trace!("Worker::sleep");
+        trace!("Worker::sleep; idx={}", self.idx);
 
         let mut state: WorkerState = self.entry().state.load(Acquire).into();
 
@@ -1178,9 +1229,12 @@ impl Worker {
                 if !state.is_pushed() {
                     debug_assert!(next.is_pushed());
 
+                    trace!("  sleeping -- push to stack; idx={}", self.idx);
+
                     // We obtained permission to push the worker into the
                     // sleeper queue.
                     if let Err(_) = self.inner.push_sleeper(self.idx) {
+                        trace!("  sleeping -- push to stack failed; idx={}", self.idx);
                         // The push failed due to the pool being terminated.
                         //
                         // This is true because the "work" being woken up for is
@@ -1230,6 +1284,8 @@ impl Worker {
                 _ => unreachable!(),
             }
 
+            trace!(" sleeping -- set WORKER_SLEEPING; idx={}", self.idx);
+
             next.set_lifecycle(WORKER_SLEEPING);
 
             let actual = self.entry().state.compare_and_swap(
@@ -1242,14 +1298,14 @@ impl Worker {
             state = actual;
         }
 
-        trace!("    -> starting to sleep");
+        trace!("    -> starting to sleep; idx={}", self.idx);
 
         // The state has been transitioned to sleeping, we can now wait on the
         // condvar. This is done in a loop as condvars can wakeup spuriously.
         loop {
             lock = self.entry().park_condvar.wait(lock).unwrap();
 
-            trace!("    -> wakeup");
+            trace!("    -> wakeup; idx={}", self.idx);
 
             // Reload the state
             state = self.entry().state.load(Acquire).into();
@@ -1560,7 +1616,14 @@ impl From<WorkerState> for usize {
 impl fmt::Debug for WorkerState {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("WorkerState")
-            .field("lifecycle", &self.lifecycle())
+            .field("lifecycle", &match self.lifecycle() {
+                WORKER_SHUTDOWN => "WORKER_SHUTDOWN",
+                WORKER_RUNNING => "WORKER_RUNNING",
+                WORKER_SLEEPING => "WORKER_SLEEPING",
+                WORKER_NOTIFIED => "WORKER_NOTIFIED",
+                WORKER_SIGNALED => "WORKER_SIGNALED",
+                _ => unreachable!(),
+            })
             .field("is_pushed", &self.is_pushed())
             .finish()
     }

@@ -17,61 +17,63 @@ thread_local!(static FOO: Cell<u32> = Cell::new(0));
 fn natural_shutdown_simple_futures() {
     let _ = ::env_logger::init();
 
-    static NUM_INC: AtomicUsize = ATOMIC_USIZE_INIT;
-    static NUM_DEC: AtomicUsize = ATOMIC_USIZE_INIT;
+    for i in 0..1_000 {
+        static NUM_INC: AtomicUsize = ATOMIC_USIZE_INIT;
+        static NUM_DEC: AtomicUsize = ATOMIC_USIZE_INIT;
 
-    FOO.with(|f| {
-        f.set(1);
+        FOO.with(|f| {
+            f.set(1);
 
-        let (tx, pool) = Pool::builder()
-            .after_start(|| {
-                NUM_INC.fetch_add(1, Relaxed);
-            })
-            .before_stop(|| {
-                NUM_DEC.fetch_add(1, Relaxed);
-            })
-            .build();
+            let (tx, pool) = Pool::builder()
+                .after_start(|| {
+                    NUM_INC.fetch_add(1, Relaxed);
+                })
+                .before_stop(|| {
+                    NUM_DEC.fetch_add(1, Relaxed);
+                })
+                .build();
 
-        let a = {
-            let (t, rx) = mpsc::channel();
-            tx.execute(lazy(move || {
-                // Makes sure this runs on a worker thread
-                FOO.with(|f| assert_eq!(f.get(), 0));
+            let a = {
+                let (t, rx) = mpsc::channel();
+                tx.execute(lazy(move || {
+                    // Makes sure this runs on a worker thread
+                    FOO.with(|f| assert_eq!(f.get(), 0));
 
-                t.send("one").unwrap();
-                Ok(())
-            })).unwrap();
-            rx
-        };
+                    t.send("one").unwrap();
+                    Ok(())
+                })).unwrap();
+                rx
+            };
 
-        let b = {
-            let (t, rx) = mpsc::channel();
-            tx.execute(lazy(move || {
-                // Makes sure this runs on a worker thread
-                FOO.with(|f| assert_eq!(f.get(), 0));
+            let b = {
+                let (t, rx) = mpsc::channel();
+                tx.execute(lazy(move || {
+                    // Makes sure this runs on a worker thread
+                    FOO.with(|f| assert_eq!(f.get(), 0));
 
-                t.send("two").unwrap();
-                Ok(())
-            })).unwrap();
-            rx
-        };
+                    t.send("two").unwrap();
+                    Ok(())
+                })).unwrap();
+                rx
+            };
 
-        drop(tx);
+            drop(tx);
 
-        assert_eq!("one", a.recv().unwrap());
-        assert_eq!("two", b.recv().unwrap());
+            assert_eq!("one", a.recv().unwrap());
+            assert_eq!("two", b.recv().unwrap());
 
-        // Wait for the pool to shutdown
-        pool.wait().unwrap();
+            // Wait for the pool to shutdown
+            pool.wait().unwrap();
 
-        // Assert that at least one thread started
-        let num_inc = NUM_INC.load(Relaxed);
-        assert!(num_inc > 0);
+            // Assert that at least one thread started
+            let num_inc = NUM_INC.load(Relaxed);
+            assert!(num_inc > 0);
 
-        // Assert that all threads shutdown
-        let num_dec = NUM_DEC.load(Relaxed);
-        assert_eq!(num_inc, num_dec);
-    });
+            // Assert that all threads shutdown
+            let num_dec = NUM_DEC.load(Relaxed);
+            assert_eq!(num_inc, num_dec);
+        });
+    }
 }
 
 #[test]
