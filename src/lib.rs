@@ -540,15 +540,15 @@ impl Inner {
     }
 
     /// Signals to the worker that it should stop
-    fn signal_stop(&self, worker: usize, mut state: WorkerState) {
-        let worker = &self.workers[worker];
+    fn signal_stop(&self, idx: usize, mut state: WorkerState) {
+        let worker = &self.workers[idx];
 
         // Transition the worker state to signaled
         loop {
             let mut next = state;
 
             if state.lifecycle() == WORKER_SHUTDOWN {
-                trace!("signal_stop -- WORKER_SHUTDOWN; idx={}", worker);
+                trace!("signal_stop -- WORKER_SHUTDOWN; idx={}", idx);
                 // If the worker is in the shutdown state, then it will never be
                 // started again.
                 self.worker_terminated();
@@ -556,7 +556,7 @@ impl Inner {
                 return;
             } else if state.lifecycle() != WORKER_SLEEPING {
                 // TODO: This is probably incorrect
-                trace!("signal_stop -- skipping; idx={}; state={:?}", worker, state);
+                trace!("signal_stop -- skipping; idx={}; state={:?}", idx, state);
                 // All other states will naturally converge to a state of
                 // shutdown.
                 return;
