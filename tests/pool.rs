@@ -7,7 +7,7 @@ use futures::future::{Future, Executor, lazy};
 use futures_pool::*;
 
 use std::cell::Cell;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
@@ -18,7 +18,7 @@ thread_local!(static FOO: Cell<u32> = Cell::new(0));
 fn natural_shutdown_simple_futures() {
     let _ = ::env_logger::init();
 
-    for i in 0..1_000 {
+    for _ in 0..1_000 {
         static NUM_INC: AtomicUsize = ATOMIC_USIZE_INIT;
         static NUM_DEC: AtomicUsize = ATOMIC_USIZE_INIT;
 
@@ -81,54 +81,59 @@ fn natural_shutdown_simple_futures() {
 fn force_shutdown_drops_futures() {
     let _ = ::env_logger::init();
 
-    static NUM_INC: AtomicUsize = ATOMIC_USIZE_INIT;
-    static NUM_DEC: AtomicUsize = ATOMIC_USIZE_INIT;
-    static NUM_DROP: AtomicUsize = ATOMIC_USIZE_INIT;
+    for _ in 0..1_000 {
+        let num_inc = Arc::new(AtomicUsize::new(0));
+        let num_dec = Arc::new(AtomicUsize::new(0));
+        let num_drop = Arc::new(AtomicUsize::new(0));
 
-    struct Never;
+        struct Never(Arc<AtomicUsize>);
 
-    impl Future for Never {
-        type Item = ();
-        type Error = ();
+        impl Future for Never {
+            type Item = ();
+            type Error = ();
 
-        fn poll(&mut self) -> Poll<(), ()> {
-            Ok(Async::NotReady)
+            fn poll(&mut self) -> Poll<(), ()> {
+                Ok(Async::NotReady)
+            }
         }
-    }
 
-    impl Drop for Never {
-        fn drop(&mut self) {
-            NUM_DROP.fetch_add(1, Relaxed);
+        impl Drop for Never {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Relaxed);
+            }
         }
+
+        let a = num_inc.clone();
+        let b = num_dec.clone();
+
+        let (tx, mut pool) = Pool::builder()
+            .after_start(move || {
+                a.fetch_add(1, Relaxed);
+            })
+            .before_stop(move || {
+                b.fetch_add(1, Relaxed);
+            })
+            .build();
+
+        tx.execute(Never(num_drop.clone())).unwrap();
+
+        pool.force_shutdown();
+
+        // Wait for the pool to shutdown
+        pool.wait().unwrap();
+
+        // Assert that only a single thread was spawned.
+        let a = num_inc.load(Relaxed);
+        assert!(a >= 1);
+
+        // Assert that all threads shutdown
+        let b = num_dec.load(Relaxed);
+        assert_eq!(a, b);
+
+        // Assert that the future was dropped
+        let c = num_drop.load(Relaxed);
+        assert_eq!(c, 1);
     }
-
-    let (tx, mut pool) = Pool::builder()
-        .after_start(|| {
-            NUM_INC.fetch_add(1, Relaxed);
-        })
-        .before_stop(|| {
-            NUM_DEC.fetch_add(1, Relaxed);
-        })
-        .build();
-
-    tx.execute(Never).unwrap();
-
-    pool.force_shutdown();
-
-    // Wait for the pool to shutdown
-    pool.wait().unwrap();
-
-    // Assert that only a single thread was spawned.
-    let num_inc = NUM_INC.load(Relaxed);
-    assert_eq!(num_inc, 1);
-
-    // Assert that all threads shutdown
-    let num_dec = NUM_DEC.load(Relaxed);
-    assert_eq!(num_inc, num_dec);
-
-    // Assert that the future was dropped
-    let num_drop = NUM_DROP.load(Relaxed);
-    assert_eq!(num_drop, 1);
 }
 
 #[test]
