@@ -18,7 +18,6 @@ fn natural_shutdown_simple_futures() {
     let _ = ::env_logger::init();
 
     for i in 0..1_000 {
-        println!("~~~~ iter={} ~~~~", i);
         static NUM_INC: AtomicUsize = ATOMIC_USIZE_INIT;
         static NUM_DEC: AtomicUsize = ATOMIC_USIZE_INIT;
 
@@ -63,10 +62,8 @@ fn natural_shutdown_simple_futures() {
             assert_eq!("one", a.recv().unwrap());
             assert_eq!("two", b.recv().unwrap());
 
-            println!("~~~~~~ WAIT ~~~~~~~");
             // Wait for the pool to shutdown
             pool.wait().unwrap();
-            println!("~~~~~~ DONE ~~~~~~~");
 
             // Assert that at least one thread started
             let num_inc = NUM_INC.load(Relaxed);
