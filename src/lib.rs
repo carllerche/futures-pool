@@ -1169,7 +1169,7 @@ impl Worker {
     /// Returns `true` if woken up due to new work arriving.
     #[inline]
     fn sleep(&self) -> bool {
-        trace!("Worker::sleep");
+        trace!("Worker::sleep; idx={}", self.idx);
 
         let mut state: WorkerState = self.entry().state.load(Acquire).into();
 
@@ -1271,7 +1271,7 @@ impl Worker {
             state = actual;
         }
 
-        trace!("    -> starting to sleep");
+        trace!("    -> starting to sleep; idx={}", self.idx);
 
         // The state has been transitioned to sleeping, we can now wait on the
         // condvar. This is done in a loop as condvars can wakeup spuriously.
