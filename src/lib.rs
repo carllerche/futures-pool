@@ -1207,9 +1207,12 @@ impl Worker {
                 if !state.is_pushed() {
                     debug_assert!(next.is_pushed());
 
+                    trace!("  sleeping -- push to stack; idx={}", self.idx);
+
                     // We obtained permission to push the worker into the
                     // sleeper queue.
                     if let Err(_) = self.inner.push_sleeper(self.idx) {
+                        trace!("  sleeping -- push to stack failed; idx={}", self.idx);
                         // The push failed due to the pool being terminated.
                         //
                         // This is true because the "work" being woken up for is
@@ -1259,6 +1262,8 @@ impl Worker {
                 _ => unreachable!(),
             }
 
+            trace!(" sleeping -- set WORKER_SLEEPING; idx={}", self.idx);
+
             next.set_lifecycle(WORKER_SLEEPING);
 
             let actual = self.entry().state.compare_and_swap(
@@ -1278,7 +1283,7 @@ impl Worker {
         loop {
             lock = self.entry().park_condvar.wait(lock).unwrap();
 
-            trace!("    -> wakeup");
+            trace!("    -> wakeup; idx={}", self.idx);
 
             // Reload the state
             state = self.entry().state.load(Acquire).into();
