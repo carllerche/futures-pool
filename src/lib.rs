@@ -547,19 +547,22 @@ impl Inner {
         loop {
             let mut next = state;
 
-            if state.lifecycle() == WORKER_SHUTDOWN {
-                trace!("signal_stop -- WORKER_SHUTDOWN; idx={}", idx);
-                // If the worker is in the shutdown state, then it will never be
-                // started again.
-                self.worker_terminated();
+            match state.lifecycle() {
+                WORKER_SHUTDOWN => {
+                    trace!("signal_stop -- WORKER_SHUTDOWN; idx={}", idx);
+                    // If the worker is in the shutdown state, then it will never be
+                    // started again.
+                    self.worker_terminated();
 
-                return;
-            } else if state.lifecycle() != WORKER_SLEEPING {
-                // TODO: This is probably incorrect
-                trace!("signal_stop -- skipping; idx={}; state={:?}", idx, state);
-                // All other states will naturally converge to a state of
-                // shutdown.
-                return;
+                    return;
+                }
+                WORKER_RUNNING | WORKER_SLEEPING => {}
+                _ => {
+                    trace!("signal_stop -- skipping; idx={}; state={:?}", idx, state);
+                    // All other states will naturally converge to a state of
+                    // shutdown.
+                    return;
+                }
             }
 
             next.set_lifecycle(WORKER_SIGNALED);
