@@ -534,7 +534,7 @@ impl Inner {
         // Wakeup all sleeping workers. They will wake up, see the state
         // transition, and terminate.
         while let Some((idx, worker_state)) = self.pop_sleeper(WORKER_SIGNALED, TERMINATED) {
-            trace!("shutdown worker; idx={:?}; state={:?}", idx, worker_state);
+            trace!("  -> shutdown worker; idx={:?}; state={:?}", idx, worker_state);
             self.signal_stop(idx, worker_state);
         }
     }
@@ -733,10 +733,29 @@ impl Inner {
         loop {
             let head = state.head();
 
-            // All values greater than MAX_WORKERS are terminals
-            if head >= MAX_WORKERS {
+            if head == EMPTY {
+                let mut next = state;
+                next.set_head(terminal);
+
+                if next == state {
+                    debug_assert!(terminal == EMPTY);
+                    return None;
+                }
+
+                let actual = self.sleep_stack.compare_and_swap(
+                    state.into(), next.into(), AcqRel).into();
+
+                if actual != state {
+                    state = actual;
+                    continue;
+                }
+
+                return None;
+            } else if head == TERMINATED {
                 return None;
             }
+
+            debug_assert!(head < MAX_WORKERS);
 
             let mut next = state;
 
