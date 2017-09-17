@@ -10,6 +10,7 @@ use std::cell::Cell;
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 use std::sync::atomic::Ordering::Relaxed;
+use std::time::Duration;
 
 thread_local!(static FOO: Cell<u32> = Cell::new(0));
 
@@ -128,4 +129,43 @@ fn force_shutdown_drops_futures() {
     // Assert that the future was dropped
     let num_drop = NUM_DROP.load(Relaxed);
     assert_eq!(num_drop, 1);
+}
+
+#[test]
+fn thread_shutdown_timeout() {
+    use std::sync::Mutex;
+
+    let _ = ::env_logger::init();
+
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    let (complete_tx, complete_rx) = mpsc::channel();
+
+    let t = Mutex::new(shutdown_tx);
+
+    let (tx, pool) = Pool::builder()
+        .keep_alive(Duration::from_millis(200))
+        .before_stop(move || t.lock().unwrap().send(()).unwrap())
+        .build();
+
+    let t = complete_tx.clone();
+    tx.execute(lazy(move || {
+        t.send(()).unwrap();
+        Ok(())
+    })).unwrap();
+
+    // The future completes
+    complete_rx.recv().unwrap();
+
+    // The thread shuts down eventually
+    shutdown_rx.recv().unwrap();
+
+    // Futures can still be run
+    tx.execute(lazy(move || {
+        complete_tx.send(()).unwrap();
+        Ok(())
+    })).unwrap();
+
+    complete_rx.recv().unwrap();
+
+    drop(pool);
 }
