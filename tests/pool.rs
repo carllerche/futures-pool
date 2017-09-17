@@ -149,7 +149,10 @@ fn thread_shutdown_timeout() {
 
     let (tx, pool) = Pool::builder()
         .keep_alive(Duration::from_millis(200))
-        .before_stop(move || t.lock().unwrap().send(()).unwrap())
+        .before_stop(move || {
+            // There could be multiple threads here
+            let _ = t.lock().unwrap().send(());
+        })
         .build();
 
     let t = complete_tx.clone();
@@ -173,4 +176,30 @@ fn thread_shutdown_timeout() {
     complete_rx.recv().unwrap();
 
     drop(pool);
+}
+
+#[test]
+fn many_oneshot_futures() {
+    const NUM: usize = 10_000;
+
+    let _ = ::env_logger::init();
+
+    for _ in 0..50 {
+        let (tx, pool) = Pool::new();
+        let cnt = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..NUM {
+            let cnt = cnt.clone();
+            tx.execute(lazy(move || {
+                cnt.fetch_add(1, Relaxed);
+                Ok(())
+            })).unwrap();
+        }
+
+        // Wait for the pool to shutdown
+        pool.wait().unwrap();
+
+        let num = cnt.load(Relaxed);
+        assert_eq!(num, NUM);
+    }
 }
