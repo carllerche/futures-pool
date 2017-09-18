@@ -2,7 +2,7 @@ extern crate env_logger;
 extern crate futures;
 extern crate futures_pool;
 
-use futures::{Poll, Async};
+use futures::{Poll, Sink, Stream, Async};
 use futures::future::{Future, Executor, lazy};
 use futures_pool::*;
 
@@ -201,5 +201,76 @@ fn many_oneshot_futures() {
 
         let num = cnt.load(Relaxed);
         assert_eq!(num, NUM);
+    }
+}
+
+#[test]
+fn many_multishot_futures() {
+    use futures::sync::mpsc;
+
+    const CHAIN: usize = 200;
+    const CYCLES: usize = 5;
+    const TRACKS: usize = 50;
+
+    let _ = ::env_logger::init();
+
+    for _ in 0..50 {
+        let (pool_tx, pool) = Pool::new();
+
+        let mut start_txs = Vec::with_capacity(TRACKS);
+        let mut final_rxs = Vec::with_capacity(TRACKS);
+
+        for _ in 0..TRACKS {
+            let (start_tx, mut chain_rx) = mpsc::channel(10);
+
+            for _ in 0..CHAIN {
+                let (next_tx, next_rx) = mpsc::channel(10);
+
+                let rx = chain_rx
+                    .map_err(|e| panic!("{:?}", e));
+
+                // Forward all the messages
+                pool_tx.execute(next_tx
+                    .send_all(rx)
+                    .map(|_| ())
+                    .map_err(|e| panic!("{:?}", e))
+                ).unwrap();
+
+                chain_rx = next_rx;
+            }
+
+            // This final task cycles if needed
+            let (final_tx, final_rx) = mpsc::channel(10);
+            let cycle_tx = start_tx.clone();
+            let mut rem = CYCLES;
+
+            pool_tx.execute(chain_rx.take(CYCLES as u64).for_each(move |msg| {
+                rem -= 1;
+                let send = if rem == 0 {
+                    final_tx.clone().send(msg)
+                } else {
+                    cycle_tx.clone().send(msg)
+                };
+
+                send.then(|res| {
+                    res.unwrap();
+                    Ok(())
+                })
+            })).unwrap();
+
+            start_txs.push(start_tx);
+            final_rxs.push(final_rx);
+        }
+
+        for start_tx in start_txs {
+            start_tx.send("ping").wait().unwrap();
+        }
+
+        for final_rx in final_rxs {
+            final_rx.wait().next().unwrap().unwrap();
+        }
+
+        // Shutdown the pool
+        pool.wait().unwrap();
     }
 }
