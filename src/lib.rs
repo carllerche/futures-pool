@@ -2,6 +2,7 @@
 
 #![deny(warnings, missing_docs, missing_debug_implementations)]
 
+extern crate coco;
 extern crate futures;
 extern crate num_cpus;
 extern crate rand;
@@ -9,10 +10,9 @@ extern crate rand;
 #[macro_use]
 extern crate log;
 
-mod deque;
 mod task;
 
-use deque::Deque;
+use coco::deque;
 use task::Task;
 
 use futures::{Future, Poll, Async};
@@ -162,14 +162,17 @@ const ABA_GUARD_MASK: usize = (1 << (32 - ABA_GUARD_SHIFT)) - 1;
 // exactly one cache line.
 #[derive(Debug)]
 struct WorkerEntry {
-    // Worker state
+    // Worker state. This is mutated when notifying the worker.
     state: AtomicUsize,
 
     // Next entry in the parked Trieber stack
     next_sleeper: UnsafeCell<usize>,
 
-    // Work-stealing deque
-    deque: Deque<Task>,
+    // Worker half of deque
+    deque: deque::Worker<Task>,
+
+    // Stealer half of deque
+    steal: deque::Stealer<Task>,
 
     // Park mutex
     park_mutex: Mutex<()>,
@@ -927,8 +930,6 @@ impl Worker {
     }
 
     fn run2(&self) {
-        use deque::Poll::*;
-
         if let Some(ref f) = self.inner.config.after_start {
             f.call();
         }
@@ -996,12 +997,7 @@ impl Worker {
         // Drain all work
         self.drain_inbound();
 
-        loop {
-            match self.entry().deque.poll() {
-                Data(_) => {}
-                Empty => break,
-                Inconsistent => {},
-            }
+        while let Some(_) = self.entry().deque.pop() {
         }
 
         if let Some(ref f) = self.inner.config.before_stop {
@@ -1064,10 +1060,10 @@ impl Worker {
     /// Returns `true` if work was found.
     #[inline]
     fn try_run_task(&self, notify: &Arc<Notifier>) -> bool {
-        use deque::Poll::*;
+        use coco::deque::Steal::*;
 
         // Poll the internal queue for a task to run
-        match self.entry().deque.poll() {
+        match self.entry().deque.steal_weak() {
             Data(task) => {
                 self.run_task(task, notify);
                 true
@@ -1082,14 +1078,14 @@ impl Worker {
     /// Returns `true` if work was found
     #[inline]
     fn try_steal_task(&self, notify: &Arc<Notifier>) -> bool {
-        use deque::Poll::*;
+        use coco::deque::Steal::*;
 
         let len = self.inner.workers.len();
 
         let mut found_work = false;
 
         worker_loop!(idx = len; len; {
-            match self.inner.workers[idx].deque.poll() {
+            match self.inner.workers[idx].steal.steal_weak() {
                 Data(task) => {
                     trace!("stole task");
 
@@ -1521,10 +1517,13 @@ impl fmt::Debug for SleepStack {
 
 impl WorkerEntry {
     fn new() -> Self {
+        let (w, s) = deque::new();
+
         WorkerEntry {
             state: AtomicUsize::new(WorkerState::default().into()),
             next_sleeper: UnsafeCell::new(0),
-            deque: Deque::new(),
+            deque: w,
+            steal: s,
             inbound: task::Queue::new(),
             park_mutex: Mutex::new(()),
             park_condvar: Condvar::new(),
@@ -1578,9 +1577,7 @@ impl WorkerEntry {
 
     #[inline]
     fn push_internal(&self, task: Task) {
-        unsafe {
-            self.deque.push(task);
-        }
+        self.deque.push(task);
     }
 
     #[inline]

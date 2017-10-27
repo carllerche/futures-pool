@@ -13,6 +13,7 @@ keywords = ["futures"]
 categories = ["concurrency", "asynchronous"]
 
 [dependencies]
+coco = "0.3"
 futures = "0.1"
 num_cpus = "1.2"
 rand = "0.3"
